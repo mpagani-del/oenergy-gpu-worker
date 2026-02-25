@@ -1,0 +1,5 @@
+tensorflow[and-cuda]==2.15.0
+tensorflowjs==4.15.0
+runpod==1.6.2
+boto3==1.34.0
+numpy==1.26.0
