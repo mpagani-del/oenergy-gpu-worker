@@ -25,6 +25,6 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
-          context: ./gpu_server
+          context: .
           push: true
           tags: ${{ secrets.DOCKERHUB_USERNAME }}/oenergy-gpu-worker:latest
