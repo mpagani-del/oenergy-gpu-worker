@@ -1,7 +1,8 @@
-import * as tf from '@tensorflow/tfjs';
 import http from 'http';
+import * as tf from '@tensorflow/tfjs';
 
 const LOG = '[GPU-Worker]';
+const weightCache = new Map();
 
 function applyAttention(sequence, windowSize, attentionUnits) {
   const attnHidden = tf.layers.dense({ units: attentionUnits, activation: 'tanh' }).apply(sequence);
@@ -53,8 +54,40 @@ function serializeWeights(model) {
   return serialized;
 }
 
-function deserializeWeights(weightData) {
-  return weightData.map(w => tf.tensor(w.data, w.shape));
+function decodeBase64ToFloat32(b64) {
+  const buf = Buffer.from(b64, 'base64');
+  return new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
+}
+
+function decodeBase64Weights(weightsB64) {
+  return weightsB64.map(w => {
+    const data = decodeBase64ToFloat32(w.b64);
+    return tf.tensor(Array.from(data), w.shape);
+  });
+}
+
+function getFoundationWeights(input) {
+  const { foundationWeightsB64, weightCacheKey, foundationWeights } = input;
+
+  if (foundationWeightsB64 && foundationWeightsB64.length > 0) {
+    const decoded = decodeBase64Weights(foundationWeightsB64);
+    if (weightCacheKey) {
+      weightCache.set(weightCacheKey, foundationWeightsB64);
+      console.log(`${LOG} Foundation weights cached as '${weightCacheKey}' (${foundationWeightsB64.length} tensors)`);
+    }
+    return decoded;
+  }
+
+  if (weightCacheKey && weightCache.has(weightCacheKey)) {
+    console.log(`${LOG} Using cached weights '${weightCacheKey}'`);
+    return decodeBase64Weights(weightCache.get(weightCacheKey));
+  }
+
+  if (foundationWeights && foundationWeights.length > 0) {
+    return foundationWeights.map(w => tf.tensor(w.data, w.shape));
+  }
+
+  return null;
 }
 
 async function handler(input) {
@@ -63,31 +96,46 @@ async function handler(input) {
   const {
     code,
     commodity,
-    features,
-    targets,
-    foundationWeights,
     config = {},
   } = input;
 
-  if (!code || !commodity || !features || !targets) {
-    return { error: 'Missing required fields: code, commodity, features, targets' };
+  if (!code || !commodity) {
+    return { error: 'Missing required fields: code, commodity' };
   }
 
+  let xTensor, yTensor;
+
+  if (input.featuresB64 && input.featuresShape) {
+    const featData = decodeBase64ToFloat32(input.featuresB64);
+    xTensor = tf.tensor(Array.from(featData), input.featuresShape);
+  } else if (input.features) {
+    xTensor = tf.tensor3d(input.features);
+  } else {
+    return { error: 'Missing features data' };
+  }
+
+  if (input.targetsB64 && input.targetsShape) {
+    const targData = decodeBase64ToFloat32(input.targetsB64);
+    yTensor = tf.tensor(Array.from(targData), input.targetsShape);
+  } else if (input.targets) {
+    yTensor = tf.tensor2d(input.targets);
+  } else {
+    xTensor.dispose();
+    return { error: 'Missing targets data' };
+  }
+
+  const windowSize = xTensor.shape[1];
+  const featureCount = xTensor.shape[2];
   const epochs = config.epochs || 3;
   const learningRate = config.learningRate || 0.0005;
 
-  console.log(`${LOG} Training ${code} (${commodity}), features=[${features.length}][${features[0]?.length || 0}], targets=[${targets.length}], epochs=${epochs}`);
+  console.log(`${LOG} Training ${code} (${commodity}), shape=[${xTensor.shape}], targets=[${yTensor.shape}], epochs=${epochs}`);
 
   try {
-    const xTensor = tf.tensor3d(features);
-    const windowSize = xTensor.shape[1];
-    const featureCount = xTensor.shape[2];
-    const yTensor = tf.tensor2d(targets);
-
     const model = buildModel(commodity, featureCount, windowSize, config);
 
-    if (foundationWeights && foundationWeights.length > 0) {
-      const fWeights = deserializeWeights(foundationWeights);
+    const fWeights = getFoundationWeights(input);
+    if (fWeights && fWeights.length > 0) {
       const mWeights = model.getWeights();
       const toSet = [];
       const minLen = Math.min(fWeights.length, mWeights.length);
@@ -146,6 +194,8 @@ async function handler(input) {
     };
   } catch (err) {
     console.error(`${LOG} Error training ${code}: ${err.message}`);
+    xTensor.dispose();
+    yTensor.dispose();
     return {
       success: false,
       error: err.message,
@@ -156,27 +206,31 @@ async function handler(input) {
 
 const server = http.createServer(async (req, res) => {
   if (req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
+    const chunks = [];
+    req.on('data', chunk => { chunks.push(chunk); });
     req.on('end', async () => {
       try {
+        const body = Buffer.concat(chunks).toString();
         const parsed = JSON.parse(body);
         const input = parsed.input || parsed;
         const result = await handler(input);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ output: result }));
+        res.end(JSON.stringify({ output: result, status: 'COMPLETED' }));
       } catch (err) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: err.message }));
+        res.end(JSON.stringify({ error: err.message, status: 'FAILED' }));
       }
     });
-  } else {
+  } else if (req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ready' }));
+    res.end(JSON.stringify({ status: 'healthy', weightCacheKeys: Array.from(weightCache.keys()) }));
+  } else {
+    res.writeHead(405);
+    res.end();
   }
 });
 
 const PORT = process.env.PORT || 8000;
 server.listen(PORT, () => {
-  console.log(`${LOG} RunPod GPU worker listening on port ${PORT}`);
+  console.log(`${LOG} HTTP server listening on port ${PORT}`);
 });
