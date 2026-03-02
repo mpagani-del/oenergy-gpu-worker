@@ -1,6 +1,7 @@
 import runpod
 import time
 import base64
+import zlib
 import numpy as np
 import os
 
@@ -17,15 +18,20 @@ LOG = '[GPU-Worker]'
 weight_cache = {}
 
 
-def decode_base64_to_float32(b64_string):
+def decode_base64_to_float32(b64_string, is_compressed=False):
     buf = base64.b64decode(b64_string)
+    if is_compressed:
+        try:
+            buf = zlib.decompress(buf)
+        except zlib.error:
+            pass
     return np.frombuffer(buf, dtype=np.float32).copy()
 
 
-def decode_base64_weights(weights_b64):
+def decode_base64_weights(weights_b64, is_compressed=False):
     result = []
     for w in weights_b64:
-        data = decode_base64_to_float32(w['b64'])
+        data = decode_base64_to_float32(w['b64'], is_compressed)
         result.append(np.reshape(data, w['shape']))
     return result
 
@@ -34,17 +40,20 @@ def get_foundation_weights(input_data):
     foundation_b64 = input_data.get('foundationWeightsB64')
     cache_key = input_data.get('weightCacheKey')
     foundation_raw = input_data.get('foundationWeights')
+    is_compressed = input_data.get('compressed', False)
 
     if foundation_b64 and len(foundation_b64) > 0:
-        decoded = decode_base64_weights(foundation_b64)
+        decoded = decode_base64_weights(foundation_b64, is_compressed)
         if cache_key:
             weight_cache[cache_key] = foundation_b64
-            print(f"{LOG} Foundation weights cached as '{cache_key}' ({len(foundation_b64)} tensors)")
+            weight_cache[f"{cache_key}_compressed"] = is_compressed
+            print(f"{LOG} Foundation weights cached as '{cache_key}' ({len(foundation_b64)} tensors, compressed={is_compressed})")
         return decoded
 
     if cache_key and cache_key in weight_cache:
-        print(f"{LOG} Using cached weights '{cache_key}'")
-        return decode_base64_weights(weight_cache[cache_key])
+        cached_compressed = weight_cache.get(f"{cache_key}_compressed", False)
+        print(f"{LOG} Using cached weights '{cache_key}' (compressed={cached_compressed})")
+        return decode_base64_weights(weight_cache[cache_key], cached_compressed)
 
     if foundation_raw and len(foundation_raw) > 0:
         return [np.array(w['data'], dtype=np.float32).reshape(w['shape']) for w in foundation_raw]
@@ -119,8 +128,12 @@ def handler(event):
     if not code or not commodity:
         return {'success': False, 'error': 'Missing required fields: code, commodity'}
 
+    is_compressed = input_data.get('compressed', False)
+    if is_compressed:
+        print(f"{LOG} Payload is zlib-compressed")
+
     if input_data.get('featuresB64') and input_data.get('featuresShape'):
-        feat_data = decode_base64_to_float32(input_data['featuresB64'])
+        feat_data = decode_base64_to_float32(input_data['featuresB64'], is_compressed)
         x_data = np.reshape(feat_data, input_data['featuresShape'])
     elif input_data.get('features'):
         x_data = np.array(input_data['features'], dtype=np.float32)
@@ -128,7 +141,7 @@ def handler(event):
         return {'success': False, 'error': 'Missing features data'}
 
     if input_data.get('targetsB64') and input_data.get('targetsShape'):
-        targ_data = decode_base64_to_float32(input_data['targetsB64'])
+        targ_data = decode_base64_to_float32(input_data['targetsB64'], is_compressed)
         y_data = np.reshape(targ_data, input_data['targetsShape'])
     elif input_data.get('targets'):
         y_data = np.array(input_data['targets'], dtype=np.float32)
