@@ -1,5 +1,5 @@
 import * as tf from '@tensorflow/tfjs';
-import runpodSdk from 'runpod-js';
+import http from 'http';
 
 const LOG = '[GPU-Worker]';
 
@@ -57,9 +57,8 @@ function deserializeWeights(weightData) {
   return weightData.map(w => tf.tensor(w.data, w.shape));
 }
 
-async function handler(event) {
+async function handler(input) {
   const startTime = Date.now();
-  const input = event.input;
 
   const {
     code,
@@ -155,5 +154,29 @@ async function handler(event) {
   }
 }
 
-runpodSdk.serverless({ handler });
-console.log(`${LOG} RunPod GPU worker started`);
+const server = http.createServer(async (req, res) => {
+  if (req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const parsed = JSON.parse(body);
+        const input = parsed.input || parsed;
+        const result = await handler(input);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ output: result }));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+  } else {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ready' }));
+  }
+});
+
+const PORT = process.env.PORT || 8000;
+server.listen(PORT, () => {
+  console.log(`${LOG} RunPod GPU worker listening on port ${PORT}`);
+});
