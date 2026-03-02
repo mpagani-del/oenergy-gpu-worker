@@ -152,9 +152,9 @@ def handler(event):
     feature_count = x_data.shape[2]
     epochs = config.get('epochs', 10)
     learning_rate = config.get('learningRate', 0.0005)
-    batch_size = config.get('batchSize', 32)
+    batch_size = min(config.get('batchSize', 32), max(16, len(x_data) // 8))
 
-    print(f"{LOG} Training {code} ({commodity}), shape={list(x_data.shape)}, targets={list(y_data.shape)}, epochs={epochs}")
+    print(f"{LOG} Training {code} ({commodity}), shape={list(x_data.shape)}, targets={list(y_data.shape)}, epochs={epochs}, batch={batch_size}")
 
     try:
         model = build_model(commodity, feature_count, window_size, config)
