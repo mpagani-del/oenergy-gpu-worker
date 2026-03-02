@@ -150,7 +150,7 @@ def handler(event):
 
     window_size = x_data.shape[1]
     feature_count = x_data.shape[2]
-    epochs = config.get('epochs', 3)
+    epochs = config.get('epochs', 10)
     learning_rate = config.get('learningRate', 0.0005)
     batch_size = config.get('batchSize', 32)
 
@@ -182,22 +182,32 @@ def handler(event):
             metrics=['mae']
         )
 
+        early_stop = tf.keras.callbacks.EarlyStopping(
+            monitor='val_mae',
+            patience=3,
+            restore_best_weights=True,
+            verbose=0
+        )
+
         history = model.fit(
             x_data, y_data,
             epochs=epochs,
             batch_size=batch_size,
             validation_split=0.2,
-            verbose=0
+            verbose=0,
+            callbacks=[early_stop]
         )
 
+        actual_epochs = len(history.history['loss'])
         val_mae = history.history.get('val_mae')
         mae_list = history.history.get('mae')
-        last_mae = float(val_mae[-1]) if val_mae else float(mae_list[-1])
+        best_mae = float(min(val_mae)) if val_mae else float(min(mae_list))
+        last_mae = best_mae
 
         trained_weights = serialize_weights(model)
 
         training_time = time.time() - start_time
-        print(f"{LOG} Done {code}: MAE={last_mae:.4f}, {training_time:.1f}s")
+        print(f"{LOG} Done {code}: MAE={last_mae:.4f}, epochs={actual_epochs}/{epochs}, {training_time:.1f}s")
 
         tf.keras.backend.clear_session()
 
@@ -205,7 +215,7 @@ def handler(event):
             'success': True,
             'weights': trained_weights,
             'mae': round(last_mae, 6),
-            'epochs': epochs,
+            'epochs': actual_epochs,
             'trainingTime': round(training_time, 2)
         }
 
