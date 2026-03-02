@@ -6,7 +6,6 @@
     "start": "node handler.js"
   },
   "dependencies": {
-    "@tensorflow/tfjs": "^4.22.0",
-    "runpod-js": "^0.3.0"
+    "@tensorflow/tfjs": "^4.22.0"
   }
 }
