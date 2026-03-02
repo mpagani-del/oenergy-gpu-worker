@@ -1,0 +1,12 @@
+{
+  "name": "lstm-gpu-worker",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node handler.js"
+  },
+  "dependencies": {
+    "@tensorflow/tfjs-node-gpu": "^4.22.0",
+    "runpod-js": "^0.3.0"
+  }
+}
