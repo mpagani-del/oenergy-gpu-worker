@@ -1,9 +1,10 @@
-FROM node:20-slim
+FROM tensorflow/tensorflow:2.15.0-gpu
 
 WORKDIR /app
 
-COPY package.json handler.js ./
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
-RUN npm install --omit=optional --ignore-scripts
+COPY handler.py ./
 
-CMD ["node", "handler.js"]
+CMD ["python", "-u", "handler.py"]
