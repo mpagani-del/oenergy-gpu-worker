@@ -1,8 +1,7 @@
-import * as tf from '@tensorflow/tfjs-node-gpu';
+import * as tf from '@tensorflow/tfjs';
 import runpodSdk from 'runpod-js';
 
 const LOG = '[GPU-Worker]';
-const foundationCache = new Map();
 
 function applyAttention(sequence, windowSize, attentionUnits) {
   const attnHidden = tf.layers.dense({ units: attentionUnits, activation: 'tanh' }).apply(sequence);
