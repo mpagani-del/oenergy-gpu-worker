@@ -2,8 +2,12 @@ import runpod
 import time
 import base64
 import zlib
+import json
+import math
 import numpy as np
 import os
+import urllib.request
+import urllib.error
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import tensorflow as tf
@@ -16,6 +20,10 @@ from tensorflow.keras.regularizers import l2
 
 LOG = '[GPU-Worker]'
 weight_cache = {}
+
+ALLOWED_URL_PREFIX = 'https://storage.googleapis.com/'
+MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
+DOWNLOAD_TIMEOUT_S = 60
 
 
 def decode_base64_to_float32(b64_string, is_compressed=False):
@@ -117,6 +125,193 @@ def serialize_weights(model):
     return result
 
 
+def serialize_weights_compressed(model):
+    result = []
+    for w in model.get_weights():
+        raw_bytes = w.astype(np.float32).tobytes()
+        compressed = zlib.compress(raw_bytes)
+        b64 = base64.b64encode(compressed).decode('ascii')
+        result.append({
+            'shape': list(w.shape),
+            'b64': b64
+        })
+    return result
+
+
+def safe_download(url, max_bytes=MAX_DOWNLOAD_BYTES, timeout=DOWNLOAD_TIMEOUT_S):
+    req = urllib.request.Request(url)
+    resp = urllib.request.urlopen(req, timeout=timeout)
+    content_length = resp.headers.get('Content-Length')
+    if content_length and int(content_length) > max_bytes:
+        resp.close()
+        raise ValueError(f"Download too large: {content_length} bytes exceeds {max_bytes} limit")
+    chunks = []
+    total = 0
+    while True:
+        chunk = resp.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            resp.close()
+            raise ValueError(f"Download exceeded {max_bytes} byte limit during read")
+        chunks.append(chunk)
+    resp.close()
+    return b''.join(chunks)
+
+
+def mask_url(url):
+    idx = url.find('?')
+    if idx >= 0:
+        return url[:idx] + '?<redacted>'
+    return url
+
+
+def derive_blob_url(manifest_url, filename):
+    idx = manifest_url.rfind('/')
+    base = manifest_url[:idx]
+    query_idx = manifest_url.find('?')
+    query = manifest_url[query_idx:] if query_idx >= 0 else ''
+    return f"{base}/{filename}{query}"
+
+
+def handler_foundation(input_data, config, start_time):
+    code = input_data.get('code')
+    commodity = input_data.get('commodity')
+
+    data_url = input_data.get('dataUrl')
+    if not data_url:
+        return {'success': False, 'error': 'Foundation mode requires dataUrl'}
+
+    if not data_url.startswith(ALLOWED_URL_PREFIX):
+        return {'success': False, 'error': f'dataUrl must start with {ALLOWED_URL_PREFIX}'}
+
+    print(f"{LOG} Foundation mode for {code} ({commodity}), downloading manifest from Object Storage...")
+
+    try:
+        manifest_raw = safe_download(data_url)
+        manifest = json.loads(manifest_raw)
+    except Exception as e:
+        return {'success': False, 'error': f'Failed to download manifest: {str(e)}'}
+
+    x_train_shape = manifest.get('xTrainShape')
+    y_train_shape = manifest.get('yTrainShape')
+    x_val_shape = manifest.get('xValShape')
+    y_val_shape = manifest.get('yValShape')
+
+    if not all([x_train_shape, y_train_shape, x_val_shape, y_val_shape]):
+        return {'success': False, 'error': 'Manifest missing required shape fields'}
+
+    blob_urls = manifest.get('blobUrls', {})
+
+    blob_files = [
+        ('x_train.bin', x_train_shape),
+        ('y_train.bin', y_train_shape),
+        ('x_val.bin', x_val_shape),
+        ('y_val.bin', y_val_shape),
+    ]
+
+    arrays = {}
+    for filename, shape in blob_files:
+        blob_url = blob_urls.get(filename) or derive_blob_url(data_url, filename)
+        if not blob_url.startswith(ALLOWED_URL_PREFIX):
+            return {'success': False, 'error': f'Blob URL for {filename} has invalid prefix'}
+        print(f"{LOG} Downloading {filename} (expected shape {shape})...")
+        try:
+            raw = safe_download(blob_url)
+        except Exception as e:
+            return {'success': False, 'error': f'Failed to download {filename}: {str(e)}'}
+
+        expected_bytes = int(np.prod(shape)) * 4
+        if len(raw) != expected_bytes:
+            return {
+                'success': False,
+                'error': f'data integrity check failed: {filename} has {len(raw)} bytes, expected {expected_bytes}'
+            }
+
+        arr = np.frombuffer(raw, dtype=np.float32).reshape(shape)
+        arrays[filename] = arr
+        del raw
+        print(f"{LOG} {filename} loaded: shape={list(arr.shape)}")
+
+    x_train = arrays['x_train.bin']
+    y_train = arrays['y_train.bin']
+    x_val = arrays['x_val.bin']
+    y_val = arrays['y_val.bin']
+    del arrays
+
+    window_size = x_train.shape[1]
+    feature_count = x_train.shape[2]
+    epochs = config.get('epochs', 30)
+    learning_rate = config.get('learningRate', 0.0005)
+    batch_size = min(config.get('batchSize', 32), max(16, len(x_train) // 8))
+
+    print(f"{LOG} Foundation training {code} ({commodity}), x_train={list(x_train.shape)}, x_val={list(x_val.shape)}, epochs={epochs}, batch={batch_size}")
+
+    try:
+        model = build_model(commodity, feature_count, window_size, config)
+
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+            loss='mean_squared_error',
+            metrics=['mae']
+        )
+
+        early_stop = tf.keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=7,
+            restore_best_weights=True,
+            verbose=0
+        )
+
+        history = model.fit(
+            x_train, y_train,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_data=(x_val, y_val),
+            verbose=0,
+            callbacks=[early_stop]
+        )
+
+        actual_epochs = len(history.history['loss'])
+        val_loss_list = history.history.get('val_loss', [])
+        best_val_loss = float(min(val_loss_list)) if val_loss_list else None
+        val_mae_list = history.history.get('val_mae', [])
+        best_mae = float(min(val_mae_list)) if val_mae_list else None
+
+        compressed_weights = serialize_weights_compressed(model)
+
+        training_time = time.time() - start_time
+        mae_str = f"{best_mae:.4f}" if best_mae is not None else "N/A"
+        print(f"{LOG} Foundation done {code}: val_loss={best_val_loss:.6f}, MAE={mae_str}, epochs={actual_epochs}/{epochs}, {training_time:.1f}s")
+
+        tf.keras.backend.clear_session()
+
+        result = {
+            'success': True,
+            'weightsB64': compressed_weights,
+            'compressed': True,
+            'epochs': actual_epochs,
+            'trainingTime': round(training_time, 2)
+        }
+        if best_val_loss is not None:
+            result['val_loss'] = round(best_val_loss, 6)
+        if best_mae is not None:
+            result['mae'] = round(best_mae, 6)
+
+        return result
+
+    except Exception as e:
+        training_time = time.time() - start_time
+        print(f"{LOG} Error in foundation training {code}: {str(e)}")
+        tf.keras.backend.clear_session()
+        return {
+            'success': False,
+            'error': str(e),
+            'trainingTime': round(training_time, 2)
+        }
+
+
 def handler(event):
     start_time = time.time()
     input_data = event['input']
@@ -127,6 +322,9 @@ def handler(event):
 
     if not code or not commodity:
         return {'success': False, 'error': 'Missing required fields: code, commodity'}
+
+    if config.get('mode') == 'foundation':
+        return handler_foundation(input_data, config, start_time)
 
     is_compressed = input_data.get('compressed', False)
     if is_compressed:
