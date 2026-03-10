@@ -1,236 +1,438 @@
-import http from 'http';
-import * as tf from '@tensorflow/tfjs';
+import runpod
+import time
+import base64
+import zlib
+import json
+import math
+import numpy as np
+import os
+import urllib.request
+import urllib.error
 
-const LOG = '[GPU-Worker]';
-const weightCache = new Map();
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+import tensorflow as tf
+from tensorflow.keras.layers import (
+    Input, LSTM, Dense, Dropout, BatchNormalization,
+    Reshape, Softmax, Multiply
+)
+from tensorflow.keras.models import Model
+from tensorflow.keras.regularizers import l2
 
-function applyAttention(sequence, windowSize, attentionUnits) {
-  const attnHidden = tf.layers.dense({ units: attentionUnits, activation: 'tanh' }).apply(sequence);
-  const attnScores = tf.layers.dense({ units: 1 }).apply(attnHidden);
-  const attnFlat = tf.layers.reshape({ targetShape: [windowSize] }).apply(attnScores);
-  const attnWeightsFlat = tf.layers.softmax().apply(attnFlat);
-  const attnWeights = tf.layers.reshape({ targetShape: [windowSize, 1] }).apply(attnWeightsFlat);
-  return tf.layers.multiply().apply([sequence, attnWeights]);
-}
+LOG = '[GPU-Worker]'
+weight_cache = {}
 
-function buildModel(commodity, featureCount, windowSize, config) {
-  const isEe = commodity === 'electricity';
-  const l1 = config.lstmUnitsL1 || (isEe ? 256 : 128);
-  const l2 = config.lstmUnitsL2 || (isEe ? 128 : 64);
-  const l3 = config.lstmUnitsL3 || (isEe ? 64 : 32);
-  const attnUnits = config.attentionUnits || 32;
-  const outputUnits = isEe ? 96 : 1;
+ALLOWED_URL_PREFIX = 'https://storage.googleapis.com/'
+MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
+DOWNLOAD_TIMEOUT_S = 60
 
-  const input = tf.input({ shape: [windowSize, featureCount] });
-  let x = input;
 
-  x = tf.layers.lstm({ units: l1, returnSequences: true, kernelRegularizer: tf.regularizers.l2({ l2: 0.001 }), recurrentInitializer: 'glorotUniform' }).apply(x);
-  x = tf.layers.batchNormalization().apply(x);
-  x = tf.layers.dropout({ rate: 0.3 }).apply(x);
+def decode_base64_to_float32(b64_string, is_compressed=False):
+    buf = base64.b64decode(b64_string)
+    if is_compressed:
+        try:
+            buf = zlib.decompress(buf)
+        except zlib.error:
+            pass
+    return np.frombuffer(buf, dtype=np.float32).copy()
 
-  x = tf.layers.lstm({ units: l2, returnSequences: true, kernelRegularizer: tf.regularizers.l2({ l2: 0.001 }), recurrentInitializer: 'glorotUniform' }).apply(x);
-  x = tf.layers.batchNormalization().apply(x);
-  x = tf.layers.dropout({ rate: 0.2 }).apply(x);
 
-  x = applyAttention(x, windowSize, attnUnits);
+def decode_base64_weights(weights_b64, is_compressed=False):
+    result = []
+    for w in weights_b64:
+        data = decode_base64_to_float32(w['b64'], is_compressed)
+        result.append(np.reshape(data, w['shape']))
+    return result
 
-  x = tf.layers.lstm({ units: l3, returnSequences: false, kernelRegularizer: tf.regularizers.l2({ l2: 0.001 }), recurrentInitializer: 'glorotUniform' }).apply(x);
-  x = tf.layers.batchNormalization().apply(x);
-  x = tf.layers.dropout({ rate: 0.1 }).apply(x);
 
-  x = tf.layers.dense({ units: l2, activation: 'relu' }).apply(x);
-  const output = tf.layers.dense({ units: outputUnits, activation: 'sigmoid' }).apply(x);
+def get_foundation_weights(input_data):
+    foundation_b64 = input_data.get('foundationWeightsB64')
+    cache_key = input_data.get('weightCacheKey')
+    foundation_raw = input_data.get('foundationWeights')
+    is_compressed = input_data.get('compressed', False)
 
-  return tf.model({ inputs: input, outputs: output });
-}
+    if foundation_b64 and len(foundation_b64) > 0:
+        decoded = decode_base64_weights(foundation_b64, is_compressed)
+        if cache_key:
+            weight_cache[cache_key] = foundation_b64
+            weight_cache[f"{cache_key}_compressed"] = is_compressed
+            print(f"{LOG} Foundation weights cached as '{cache_key}' ({len(foundation_b64)} tensors, compressed={is_compressed})")
+        return decoded
 
-function serializeWeights(model) {
-  const weights = model.getWeights();
-  const serialized = weights.map(w => ({
-    shape: w.shape,
-    data: Array.from(w.dataSync()),
-  }));
-  weights.forEach(w => w.dispose());
-  return serialized;
-}
+    if cache_key and cache_key in weight_cache:
+        cached_compressed = weight_cache.get(f"{cache_key}_compressed", False)
+        print(f"{LOG} Using cached weights '{cache_key}' (compressed={cached_compressed})")
+        return decode_base64_weights(weight_cache[cache_key], cached_compressed)
 
-function decodeBase64ToFloat32(b64) {
-  const buf = Buffer.from(b64, 'base64');
-  return new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
-}
+    if foundation_raw and len(foundation_raw) > 0:
+        return [np.array(w['data'], dtype=np.float32).reshape(w['shape']) for w in foundation_raw]
 
-function decodeBase64Weights(weightsB64) {
-  return weightsB64.map(w => {
-    const data = decodeBase64ToFloat32(w.b64);
-    return tf.tensor(Array.from(data), w.shape);
-  });
-}
+    return None
 
-function getFoundationWeights(input) {
-  const { foundationWeightsB64, weightCacheKey, foundationWeights } = input;
 
-  if (foundationWeightsB64 && foundationWeightsB64.length > 0) {
-    const decoded = decodeBase64Weights(foundationWeightsB64);
-    if (weightCacheKey) {
-      weightCache.set(weightCacheKey, foundationWeightsB64);
-      console.log(`${LOG} Foundation weights cached as '${weightCacheKey}' (${foundationWeightsB64.length} tensors)`);
-    }
-    return decoded;
-  }
+def apply_attention(sequence, window_size, attention_units):
+    attn_hidden = Dense(attention_units, activation='tanh')(sequence)
+    attn_scores = Dense(1)(attn_hidden)
+    attn_flat = Reshape((window_size,))(attn_scores)
+    attn_weights_flat = Softmax()(attn_flat)
+    attn_weights = Reshape((window_size, 1))(attn_weights_flat)
+    return Multiply()([sequence, attn_weights])
 
-  if (weightCacheKey && weightCache.has(weightCacheKey)) {
-    console.log(`${LOG} Using cached weights '${weightCacheKey}'`);
-    return decodeBase64Weights(weightCache.get(weightCacheKey));
-  }
 
-  if (foundationWeights && foundationWeights.length > 0) {
-    return foundationWeights.map(w => tf.tensor(w.data, w.shape));
-  }
+def build_model(commodity, feature_count, window_size, config):
+    is_ee = commodity == 'electricity'
+    l1 = config.get('lstmUnitsL1') or (256 if is_ee else 128)
+    l2_units = config.get('lstmUnitsL2') or (128 if is_ee else 64)
+    l3 = config.get('lstmUnitsL3') or (64 if is_ee else 32)
+    attn_units = config.get('attentionUnits') or 32
+    output_units = 96 if is_ee else 1
 
-  return null;
-}
+    inp = Input(shape=(window_size, feature_count))
+    x = inp
 
-async function handler(input) {
-  const startTime = Date.now();
+    x = LSTM(l1, return_sequences=True,
+             kernel_regularizer=l2(0.001),
+             recurrent_initializer='glorot_uniform')(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.3)(x)
 
-  const {
-    code,
-    commodity,
-    config = {},
-  } = input;
+    x = LSTM(l2_units, return_sequences=True,
+             kernel_regularizer=l2(0.001),
+             recurrent_initializer='glorot_uniform')(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.2)(x)
 
-  if (!code || !commodity) {
-    return { error: 'Missing required fields: code, commodity' };
-  }
+    x = apply_attention(x, window_size, attn_units)
 
-  let xTensor, yTensor;
+    x = LSTM(l3, return_sequences=False,
+             kernel_regularizer=l2(0.001),
+             recurrent_initializer='glorot_uniform')(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.1)(x)
 
-  if (input.featuresB64 && input.featuresShape) {
-    const featData = decodeBase64ToFloat32(input.featuresB64);
-    xTensor = tf.tensor(Array.from(featData), input.featuresShape);
-  } else if (input.features) {
-    xTensor = tf.tensor3d(input.features);
-  } else {
-    return { error: 'Missing features data' };
-  }
+    x = Dense(l2_units, activation='relu')(x)
+    out = Dense(output_units, activation='sigmoid')(x)
 
-  if (input.targetsB64 && input.targetsShape) {
-    const targData = decodeBase64ToFloat32(input.targetsB64);
-    yTensor = tf.tensor(Array.from(targData), input.targetsShape);
-  } else if (input.targets) {
-    yTensor = tf.tensor2d(input.targets);
-  } else {
-    xTensor.dispose();
-    return { error: 'Missing targets data' };
-  }
+    return Model(inputs=inp, outputs=out)
 
-  const windowSize = xTensor.shape[1];
-  const featureCount = xTensor.shape[2];
-  const epochs = config.epochs || 3;
-  const learningRate = config.learningRate || 0.0005;
 
-  console.log(`${LOG} Training ${code} (${commodity}), shape=[${xTensor.shape}], targets=[${yTensor.shape}], epochs=${epochs}`);
+def serialize_weights(model):
+    result = []
+    for w in model.get_weights():
+        result.append({
+            'shape': list(w.shape),
+            'data': w.flatten().tolist()
+        })
+    return result
 
-  try {
-    const model = buildModel(commodity, featureCount, windowSize, config);
 
-    const fWeights = getFoundationWeights(input);
-    if (fWeights && fWeights.length > 0) {
-      const mWeights = model.getWeights();
-      const toSet = [];
-      const minLen = Math.min(fWeights.length, mWeights.length);
-      for (let i = 0; i < mWeights.length; i++) {
-        if (i < minLen && fWeights[i].shape.toString() === mWeights[i].shape.toString()) {
-          toSet.push(fWeights[i].clone());
-        } else {
-          toSet.push(mWeights[i].clone());
+def serialize_weights_compressed(model):
+    result = []
+    for w in model.get_weights():
+        raw_bytes = w.astype(np.float32).tobytes()
+        compressed = zlib.compress(raw_bytes)
+        b64 = base64.b64encode(compressed).decode('ascii')
+        result.append({
+            'shape': list(w.shape),
+            'b64': b64
+        })
+    return result
+
+
+def safe_download(url, max_bytes=MAX_DOWNLOAD_BYTES, timeout=DOWNLOAD_TIMEOUT_S):
+    req = urllib.request.Request(url)
+    resp = urllib.request.urlopen(req, timeout=timeout)
+    content_length = resp.headers.get('Content-Length')
+    if content_length and int(content_length) > max_bytes:
+        resp.close()
+        raise ValueError(f"Download too large: {content_length} bytes exceeds {max_bytes} limit")
+    chunks = []
+    total = 0
+    while True:
+        chunk = resp.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            resp.close()
+            raise ValueError(f"Download exceeded {max_bytes} byte limit during read")
+        chunks.append(chunk)
+    resp.close()
+    return b''.join(chunks)
+
+
+def mask_url(url):
+    idx = url.find('?')
+    if idx >= 0:
+        return url[:idx] + '?<redacted>'
+    return url
+
+
+def derive_blob_url(manifest_url, filename):
+    idx = manifest_url.rfind('/')
+    base = manifest_url[:idx]
+    query_idx = manifest_url.find('?')
+    query = manifest_url[query_idx:] if query_idx >= 0 else ''
+    return f"{base}/{filename}{query}"
+
+
+def handler_foundation(input_data, config, start_time):
+    code = input_data.get('code')
+    commodity = input_data.get('commodity')
+
+    data_url = input_data.get('dataUrl')
+    if not data_url:
+        return {'success': False, 'error': 'Foundation mode requires dataUrl'}
+
+    if not data_url.startswith(ALLOWED_URL_PREFIX):
+        return {'success': False, 'error': f'dataUrl must start with {ALLOWED_URL_PREFIX}'}
+
+    print(f"{LOG} Foundation mode for {code} ({commodity}), downloading manifest from Object Storage...")
+
+    try:
+        manifest_raw = safe_download(data_url)
+        manifest = json.loads(manifest_raw)
+    except Exception as e:
+        return {'success': False, 'error': f'Failed to download manifest: {str(e)}'}
+
+    x_train_shape = manifest.get('xTrainShape')
+    y_train_shape = manifest.get('yTrainShape')
+    x_val_shape = manifest.get('xValShape')
+    y_val_shape = manifest.get('yValShape')
+
+    if not all([x_train_shape, y_train_shape, x_val_shape, y_val_shape]):
+        return {'success': False, 'error': 'Manifest missing required shape fields'}
+
+    blob_urls = manifest.get('blobUrls', {})
+
+    blob_files = [
+        ('x_train.bin', x_train_shape),
+        ('y_train.bin', y_train_shape),
+        ('x_val.bin', x_val_shape),
+        ('y_val.bin', y_val_shape),
+    ]
+
+    arrays = {}
+    for filename, shape in blob_files:
+        blob_url = blob_urls.get(filename) or derive_blob_url(data_url, filename)
+        if not blob_url.startswith(ALLOWED_URL_PREFIX):
+            return {'success': False, 'error': f'Blob URL for {filename} has invalid prefix'}
+        print(f"{LOG} Downloading {filename} (expected shape {shape})...")
+        try:
+            raw = safe_download(blob_url)
+        except Exception as e:
+            return {'success': False, 'error': f'Failed to download {filename}: {str(e)}'}
+
+        expected_bytes = int(np.prod(shape)) * 4
+        if len(raw) != expected_bytes:
+            return {
+                'success': False,
+                'error': f'data integrity check failed: {filename} has {len(raw)} bytes, expected {expected_bytes}'
+            }
+
+        arr = np.frombuffer(raw, dtype=np.float32).reshape(shape)
+        arrays[filename] = arr
+        del raw
+        print(f"{LOG} {filename} loaded: shape={list(arr.shape)}")
+
+    x_train = arrays['x_train.bin']
+    y_train = arrays['y_train.bin']
+    x_val = arrays['x_val.bin']
+    y_val = arrays['y_val.bin']
+    del arrays
+
+    window_size = x_train.shape[1]
+    feature_count = x_train.shape[2]
+    epochs = config.get('epochs', 30)
+    learning_rate = config.get('learningRate', 0.0005)
+    batch_size = min(config.get('batchSize', 32), max(16, len(x_train) // 8))
+
+    print(f"{LOG} Foundation training {code} ({commodity}), x_train={list(x_train.shape)}, x_val={list(x_val.shape)}, epochs={epochs}, batch={batch_size}")
+
+    try:
+        model = build_model(commodity, feature_count, window_size, config)
+
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+            loss='mean_squared_error',
+            metrics=['mae']
+        )
+
+        early_stop = tf.keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=7,
+            restore_best_weights=True,
+            verbose=0
+        )
+
+        history = model.fit(
+            x_train, y_train,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_data=(x_val, y_val),
+            verbose=0,
+            callbacks=[early_stop]
+        )
+
+        actual_epochs = len(history.history['loss'])
+        val_loss_list = history.history.get('val_loss', [])
+        best_val_loss = float(min(val_loss_list)) if val_loss_list else None
+        val_mae_list = history.history.get('val_mae', [])
+        best_mae = float(min(val_mae_list)) if val_mae_list else None
+
+        compressed_weights = serialize_weights_compressed(model)
+
+        training_time = time.time() - start_time
+        mae_str = f"{best_mae:.4f}" if best_mae is not None else "N/A"
+        print(f"{LOG} Foundation done {code}: val_loss={best_val_loss:.6f}, MAE={mae_str}, epochs={actual_epochs}/{epochs}, {training_time:.1f}s")
+
+        tf.keras.backend.clear_session()
+
+        result = {
+            'success': True,
+            'weightsB64': compressed_weights,
+            'compressed': True,
+            'epochs': actual_epochs,
+            'trainingTime': round(training_time, 2)
         }
-      }
-      model.setWeights(toSet);
-      fWeights.forEach(w => w.dispose());
-      mWeights.forEach(w => w.dispose());
-      toSet.forEach(w => w.dispose());
+        if best_val_loss is not None:
+            result['val_loss'] = round(best_val_loss, 6)
+        if best_mae is not None:
+            result['mae'] = round(best_mae, 6)
 
-      for (const layer of model.layers) {
-        if (layer.getClassName() === 'LSTM') {
-          layer.trainable = false;
+        return result
+
+    except Exception as e:
+        training_time = time.time() - start_time
+        print(f"{LOG} Error in foundation training {code}: {str(e)}")
+        tf.keras.backend.clear_session()
+        return {
+            'success': False,
+            'error': str(e),
+            'trainingTime': round(training_time, 2)
         }
-      }
-      console.log(`${LOG} Foundation weights applied, LSTM layers frozen`);
-    }
 
-    model.compile({
-      optimizer: tf.train.adam(learningRate),
-      loss: 'meanSquaredError',
-      metrics: ['mae'],
-    });
 
-    const history = await model.fit(xTensor, yTensor, {
-      epochs,
-      batchSize: config.batchSize || 32,
-      validationSplit: 0.2,
-      verbose: 0,
-    });
+def handler(event):
+    start_time = time.time()
+    input_data = event['input']
 
-    const lastMae = history.history.val_mae
-      ? history.history.val_mae[history.history.val_mae.length - 1]
-      : history.history.mae[history.history.mae.length - 1];
+    code = input_data.get('code')
+    commodity = input_data.get('commodity')
+    config = input_data.get('config', {})
 
-    const trainedWeights = serializeWeights(model);
+    if not code or not commodity:
+        return {'success': False, 'error': 'Missing required fields: code, commodity'}
 
-    model.dispose();
-    xTensor.dispose();
-    yTensor.dispose();
+    if config.get('mode') == 'foundation':
+        return handler_foundation(input_data, config, start_time)
 
-    const trainingTime = (Date.now() - startTime) / 1000;
-    console.log(`${LOG} Done ${code}: MAE=${lastMae.toFixed(4)}, ${trainingTime.toFixed(1)}s`);
+    is_compressed = input_data.get('compressed', False)
+    if is_compressed:
+        print(f"{LOG} Payload is zlib-compressed")
 
-    return {
-      success: true,
-      weights: trainedWeights,
-      mae: parseFloat(lastMae.toFixed(6)),
-      epochs,
-      trainingTime,
-    };
-  } catch (err) {
-    console.error(`${LOG} Error training ${code}: ${err.message}`);
-    xTensor.dispose();
-    yTensor.dispose();
-    return {
-      success: false,
-      error: err.message,
-      trainingTime: (Date.now() - startTime) / 1000,
-    };
-  }
-}
+    if input_data.get('featuresB64') and input_data.get('featuresShape'):
+        feat_data = decode_base64_to_float32(input_data['featuresB64'], is_compressed)
+        x_data = np.reshape(feat_data, input_data['featuresShape'])
+    elif input_data.get('features'):
+        x_data = np.array(input_data['features'], dtype=np.float32)
+    else:
+        return {'success': False, 'error': 'Missing features data'}
 
-const server = http.createServer(async (req, res) => {
-  if (req.method === 'POST') {
-    const chunks = [];
-    req.on('data', chunk => { chunks.push(chunk); });
-    req.on('end', async () => {
-      try {
-        const body = Buffer.concat(chunks).toString();
-        const parsed = JSON.parse(body);
-        const input = parsed.input || parsed;
-        const result = await handler(input);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ output: result, status: 'COMPLETED' }));
-      } catch (err) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: err.message, status: 'FAILED' }));
-      }
-    });
-  } else if (req.method === 'GET') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'healthy', weightCacheKeys: Array.from(weightCache.keys()) }));
-  } else {
-    res.writeHead(405);
-    res.end();
-  }
-});
+    if input_data.get('targetsB64') and input_data.get('targetsShape'):
+        targ_data = decode_base64_to_float32(input_data['targetsB64'], is_compressed)
+        y_data = np.reshape(targ_data, input_data['targetsShape'])
+    elif input_data.get('targets'):
+        y_data = np.array(input_data['targets'], dtype=np.float32)
+    else:
+        return {'success': False, 'error': 'Missing targets data'}
 
-const PORT = process.env.PORT || 8000;
-server.listen(PORT, () => {
-  console.log(`${LOG} HTTP server listening on port ${PORT}`);
-});
+    window_size = x_data.shape[1]
+    feature_count = x_data.shape[2]
+    epochs = config.get('epochs', 10)
+    learning_rate = config.get('learningRate', 0.0005)
+    batch_size = min(config.get('batchSize', 32), max(16, len(x_data) // 8))
+
+    print(f"{LOG} Training {code} ({commodity}), shape={list(x_data.shape)}, targets={list(y_data.shape)}, epochs={epochs}, batch={batch_size}")
+
+    try:
+        model = build_model(commodity, feature_count, window_size, config)
+
+        f_weights = get_foundation_weights(input_data)
+        if f_weights and len(f_weights) > 0:
+            m_weights = model.get_weights()
+            to_set = []
+            min_len = min(len(f_weights), len(m_weights))
+            for i in range(len(m_weights)):
+                if i < min_len and list(f_weights[i].shape) == list(m_weights[i].shape):
+                    to_set.append(f_weights[i])
+                else:
+                    to_set.append(m_weights[i])
+            model.set_weights(to_set)
+
+            for layer in model.layers:
+                if isinstance(layer, LSTM):
+                    layer.trainable = False
+            print(f"{LOG} Foundation weights applied, LSTM layers frozen")
+
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+            loss='mean_squared_error',
+            metrics=['mae']
+        )
+
+        early_stop = tf.keras.callbacks.EarlyStopping(
+            monitor='val_mae',
+            patience=3,
+            restore_best_weights=True,
+            verbose=0
+        )
+
+        history = model.fit(
+            x_data, y_data,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_split=0.2,
+            verbose=0,
+            callbacks=[early_stop]
+        )
+
+        actual_epochs = len(history.history['loss'])
+        val_mae = history.history.get('val_mae')
+        mae_list = history.history.get('mae')
+        best_mae = float(min(val_mae)) if val_mae else float(min(mae_list))
+        last_mae = best_mae
+
+        trained_weights = serialize_weights(model)
+
+        training_time = time.time() - start_time
+        print(f"{LOG} Done {code}: MAE={last_mae:.4f}, epochs={actual_epochs}/{epochs}, {training_time:.1f}s")
+
+        tf.keras.backend.clear_session()
+
+        return {
+            'success': True,
+            'weights': trained_weights,
+            'mae': round(last_mae, 6),
+            'epochs': actual_epochs,
+            'trainingTime': round(training_time, 2)
+        }
+
+    except Exception as e:
+        training_time = time.time() - start_time
+        print(f"{LOG} Error training {code}: {str(e)}")
+        tf.keras.backend.clear_session()
+        return {
+            'success': False,
+            'error': str(e),
+            'trainingTime': round(training_time, 2)
+        }
+
+
+if __name__ == '__main__':
+    print(f"{LOG} Starting RunPod Serverless worker...")
+    gpus = tf.config.list_physical_devices('GPU')
+    print(f"{LOG} GPUs available: {len(gpus)}")
+    for gpu in gpus:
+        print(f"{LOG}   {gpu}")
+        tf.config.experimental.set_memory_growth(gpu, True)
+    runpod.serverless.start({'handler': handler})
